@@ -1,0 +1,138 @@
+pip install PyPDF2 pdfplumber sentence-transformers faiss-cpu transformers torch
+import os
+import faiss
+import numpy as np
+import torch
+from typing import List, Dict, Any
+from sentence_transformers import SentenceTransformer
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer
+import pdfplumber
+
+class PDFRAGPipeline:
+    def _init_(self, 
+                 embedding_model: str = 'all-MiniLM-L6-v2', 
+                 qa_model: str = 'deepset/roberta-base-squad2'):
+        # Initialize embedding model
+        self.embedding_model = SentenceTransformer(embedding_model)
+        
+        # Initialize vector database
+        self.vector_dimension = self.embedding_model.get_sentence_embedding_dimension()
+        self.index = faiss.IndexFlatL2(self.vector_dimension)
+        
+        # Initialize QA model
+        self.qa_tokenizer = AutoTokenizer.from_pretrained(qa_model)
+        self.qa_model = AutoModelForQuestionAnswering.from_pretrained(qa_model)
+        
+        # Storage for chunks and metadata
+        self.chunks = []
+        self.chunk_metadata = []
+    
+    def extract_pdf_chunks(self, pdf_path: str, chunk_size: int = 200, overlap: int = 50) -> List[str]:
+        """
+        Extract text chunks from PDF with specified size and overlap
+        """
+        chunks = []
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                text = page.extract_text()
+                
+                # Basic chunking strategy
+                words = text.split()
+                for i in range(0, len(words), chunk_size - overlap):
+                    chunk = ' '.join(words[i:i+chunk_size])
+                    chunks.append({
+                        'text': chunk,
+                        'page': page_num + 1
+                    })
+        
+        return chunks
+    
+    def embed_chunks(self, chunks: List[Dict[str, Any]]) -> None:
+        """
+        Convert text chunks to embeddings and store in vector database
+        """
+        for chunk in chunks:
+            embedding = self.embedding_model.encode(chunk['text'])
+            self.index.add(np.array([embedding]))
+            
+            self.chunks.append(chunk['text'])
+            self.chunk_metadata.append({
+                'page': chunk['page']
+            })
+    
+    def similarity_search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """
+        Perform similarity search for a given query
+        """
+        query_embedding = self.embedding_model.encode([query])
+        distances, indices = self.index.search(query_embedding, top_k)
+        
+        results = []
+        for idx in indices[0]:
+            results.append({
+                'text': self.chunks[idx],
+                'metadata': self.chunk_metadata[idx]
+            })
+        
+        return results
+    
+    def generate_response(self, query: str, context: List[str]) -> str:
+        """
+        Generate response using retrieved context
+        """
+        # Combine context for more comprehensive input
+        full_context = ' '.join(context)
+        
+        # Use QA model to extract precise answer
+        inputs = self.qa_tokenizer(query, full_context, return_tensors='pt')
+        outputs = self.qa_model(**inputs)
+        
+        start_scores = outputs.start_logits
+        end_scores = outputs.end_logits
+        
+        # Get the most likely answer span
+        start_index = torch.argmax(start_scores)
+        end_index = torch.argmax(end_scores)
+        
+        answer = self.qa_tokenizer.decode(
+            inputs['input_ids'][0][start_index:end_index+1]
+        )
+        
+        return answer
+    
+    def process_pdf(self, pdf_path: str):
+        """
+        Full pipeline for processing a PDF
+        """
+        chunks = self.extract_pdf_chunks(pdf_path)
+        self.embed_chunks(chunks)
+    
+    def query(self, query: str) -> str:
+        """
+        Main query method
+        """
+        # Retrieve most relevant chunks
+        retrieved_chunks = self.similarity_search(query)
+        
+        # Generate response using retrieved context
+        chunk_texts = [chunk['text'] for chunk in retrieved_chunks]
+        response = self.generate_response(query, chunk_texts)
+        
+        return response
+
+# Example usage
+def main():
+    rag_pipeline = PDFRAGPipeline()
+    
+    # Process PDF
+    rag_pipeline.process_pdf('path/to/your/pdf')
+    
+    # Example queries
+    query1 = "What is the unemployment rate for college graduates?"
+    query2 = "Compare unemployment rates across different education levels"
+    
+    print(rag_pipeline.query(query1))
+    print(rag_pipeline.query(query2))
+
+if _name_ == '_main_':
+    main()
